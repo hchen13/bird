@@ -310,7 +310,7 @@ export class SweetisticsClient {
           {
             method: 'GET',
             headers,
-          }
+          },
         );
       } catch (error) {
         return { success: false, error: this.normalizeError(error) };
@@ -466,7 +466,11 @@ export class SweetisticsClient {
     return { success: true, tweets };
   }
 
-  async uploadMedia(input: { data: string; mimeType: string; alt?: string }): Promise<{ success: boolean; mediaId?: string; error?: string }> {
+  async uploadMedia(input: {
+    data: string;
+    mimeType: string;
+    alt?: string;
+  }): Promise<{ success: boolean; mediaId?: string; error?: string }> {
     try {
       const response = await this.fetchWithTimeout(`${this.baseUrl}/api/actions/media/upload`, {
         method: 'POST',

@@ -9,13 +9,14 @@
  *   bird read <tweet-id-or-url>
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import JSON5 from 'json5';
 import kleur from 'kleur';
 import { resolveCredentials } from './lib/cookies.js';
+import { extractListId } from './lib/extract-list-id.js';
 import { extractTweetId } from './lib/extract-tweet-id.js';
 import { SweetisticsClient } from './lib/sweetistics-client.js';
 import { type TweetData, TwitterClient } from './lib/twitter-client.js';
@@ -103,6 +104,8 @@ program.addHelpText(
 program
   .option('--auth-token <token>', 'Twitter auth_token cookie')
   .option('--ct0 <token>', 'Twitter ct0 cookie')
+  .option('--timeout <ms>', 'Request timeout in milliseconds')
+  .option('--cookie-source <source>', 'Cookie source: chrome, firefox, or env', collect, [])
   .option('--chrome-profile <name>', 'Chrome profile name for cookie extraction', config.chromeProfile)
   .option('--firefox-profile <name>', 'Firefox profile name for cookie extraction', config.firefoxProfile)
   .option('--media <path>', 'Attach media file (repeatable, up to 4 images or 1 video)', collect, [])
@@ -176,12 +179,50 @@ function loadMedia(opts: { media: string[]; alts: string[] }): MediaSpec[] {
   return specs;
 }
 
+function writeJsonSync(value: unknown) {
+  const stdout = process.stdout as typeof process.stdout & { _handle?: { setBlocking?: (blocking: boolean) => void } };
+  if (stdout._handle?.setBlocking) {
+    stdout._handle.setBlocking(true);
+  }
+  const buffer = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+  let offset = 0;
+  while (offset < buffer.length) {
+    offset += writeSync(1, buffer, offset, buffer.length - offset);
+  }
+}
+
+function resolveCookieSourceOptions(options: {
+  cookieSource?: string[];
+  allowChrome?: boolean;
+  allowFirefox?: boolean;
+}) {
+  const sources = options.cookieSource ?? [];
+  if (sources.length === 0) {
+    return {
+      allowChrome: options.allowChrome ?? config.allowChrome,
+      allowFirefox: options.allowFirefox ?? config.allowFirefox,
+    };
+  }
+  const normalized = sources.map((s) => s.toLowerCase());
+  return {
+    allowChrome: normalized.includes('chrome'),
+    allowFirefox: normalized.includes('firefox'),
+  };
+}
+
+function parseTimeoutMs(value?: string): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error('--timeout must be a positive integer');
+  return parsed;
+}
+
 function printTweets(
   tweets: TweetData[],
   opts: { json?: boolean; emptyMessage?: string; showSeparator?: boolean } = {},
 ) {
   if (opts.json) {
-    console.log(JSON.stringify(tweets, null, 2));
+    writeJsonSync(tweets);
     return;
   }
   if (tweets.length === 0) {
@@ -265,7 +306,9 @@ program
     }
 
     if (media.length > 0) {
-      console.error('❌ Media uploads are only supported via Sweetistics. Provide SWEETISTICS_API_KEY or --engine sweetistics.');
+      console.error(
+        '❌ Media uploads are only supported via Sweetistics. Provide SWEETISTICS_API_KEY or --engine sweetistics.',
+      );
       process.exit(1);
     }
 
@@ -384,7 +427,9 @@ program
     }
 
     if (media.length > 0) {
-      console.error('❌ Media uploads are only supported via Sweetistics. Provide SWEETISTICS_API_KEY or --engine sweetistics.');
+      console.error(
+        '❌ Media uploads are only supported via Sweetistics. Provide SWEETISTICS_API_KEY or --engine sweetistics.',
+      );
       process.exit(1);
     }
 
@@ -911,6 +956,79 @@ program
       console.error(`❌ Failed to determine current user: ${result.error ?? 'Unknown error'}`);
       process.exit(1);
     }
+  });
+
+// List timeline command
+program
+  .command('list-timeline <list-id-or-url>')
+  .description('Get tweets from a list timeline')
+  .option('-n, --count <number>', 'Number of tweets to fetch', '20')
+  .option('--all', 'Fetch all tweets from list timeline')
+  .option('--max-pages <number>', 'Fetch N pages, implies pagination')
+  .option('--cursor <string>', 'Resume pagination from a cursor')
+  .option('--json', 'Output as JSON')
+  .option('--json-full', 'Output as JSON with full raw API response in _raw field')
+  .action(async (listInput: string, cmdOpts: Record<string, string | boolean | undefined>) => {
+    const opts = program.opts();
+    const listId = extractListId(listInput);
+    if (!listId) {
+      console.error('❌ Invalid list ID or URL');
+      process.exit(1);
+    }
+
+    const count = Number.parseInt(String(cmdOpts.count ?? '20'), 10);
+    if (!Number.isFinite(count) || count <= 0) {
+      console.error('❌ --count must be a positive integer');
+      process.exit(1);
+    }
+    const maxPages = cmdOpts.maxPages ? Number.parseInt(String(cmdOpts.maxPages), 10) : undefined;
+    if (maxPages !== undefined && (!Number.isFinite(maxPages) || maxPages <= 0)) {
+      console.error('❌ --max-pages must be a positive integer');
+      process.exit(1);
+    }
+
+    const cookieSources = resolveCookieSourceOptions(opts);
+    const { cookies, warnings } = await resolveCredentials({
+      authToken: opts.authToken,
+      ct0: opts.ct0,
+      chromeProfile: opts.chromeProfile || config.chromeProfile,
+      firefoxProfile: opts.firefoxProfile || config.firefoxProfile,
+      ...cookieSources,
+    });
+    for (const warning of warnings) {
+      console.error(`⚠️ ${warning}`);
+    }
+    if (!cookies.authToken || !cookies.ct0) {
+      console.error('❌ Missing required credentials');
+      process.exit(1);
+    }
+
+    const client = new TwitterClient({ cookies, timeoutMs: parseTimeoutMs(opts.timeout) });
+    const timelineOptions = {
+      cursor: typeof cmdOpts.cursor === 'string' ? cmdOpts.cursor : undefined,
+      includeRaw: Boolean(cmdOpts.jsonFull),
+      maxPages,
+    };
+    const usePagination = Boolean(cmdOpts.all || cmdOpts.cursor || maxPages);
+    const result = usePagination
+      ? await client.getAllListTimeline(listId, timelineOptions)
+      : await client.getListTimeline(listId, count, timelineOptions);
+
+    if (!result.success || !result.tweets) {
+      console.error(`❌ Failed to fetch list timeline: ${result.error ?? 'Unknown error'}`);
+      process.exit(1);
+    }
+
+    if (cmdOpts.json || cmdOpts.jsonFull) {
+      if (usePagination) {
+        writeJsonSync({ tweets: result.tweets, nextCursor: result.nextCursor ?? null });
+      } else {
+        writeJsonSync(result.tweets);
+      }
+      return;
+    }
+
+    printTweets(result.tweets, { emptyMessage: 'No tweets found in list timeline.' });
   });
 
 // Check command - verify credentials

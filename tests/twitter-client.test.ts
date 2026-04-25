@@ -455,9 +455,12 @@ describe('TwitterClient', () => {
     it('getThread returns sorted thread by createdAt', async () => {
       const payload = makeConversationPayload();
       // swap dates to verify sorting
-      payload.data.threaded_conversation_with_injections_v2.instructions[0]?.entries?.[0]?.content?.itemContent?.tweet_results?.result?.legacy &&
-        ((payload.data.threaded_conversation_with_injections_v2.instructions[0]!.entries![0]!.content!.itemContent!
-          .tweet_results!.result!.legacy!.created_at = '2024-01-03T00:00:00Z'));
+      const legacy =
+        payload.data.threaded_conversation_with_injections_v2.instructions[0]?.entries?.[0]?.content?.itemContent
+          ?.tweet_results?.result?.legacy;
+      if (legacy) {
+        legacy.created_at = '2024-01-03T00:00:00Z';
+      }
 
       mockFetch.mockResolvedValue({
         ok: true,

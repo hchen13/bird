@@ -48,7 +48,9 @@ describe('cookies', () => {
         if (lower.includes('firefox')) return true;
         return false;
       });
-      (fs.readdirSync as unknown as vi.Mock).mockReturnValue([{ isDirectory: () => true, name: 'abc.default-release' }]);
+      (fs.readdirSync as unknown as vi.Mock).mockReturnValue([
+        { isDirectory: () => true, name: 'abc.default-release' },
+      ]);
       (fs.copyFileSync as unknown as vi.Mock).mockImplementation(() => {});
       (fs.mkdtempSync as unknown as vi.Mock).mockReturnValue('/tmp/test-dir');
 
@@ -56,7 +58,11 @@ describe('cookies', () => {
       const { execSync } = await import('node:child_process');
       (execSync as unknown as vi.Mock).mockReturnValue('auth_token|firefox_auth\nct0|firefox_ct0');
 
-      const result = await resolveCredentials({ allowFirefox: true, allowChrome: false, firefoxProfile: 'abc.default-release' });
+      const result = await resolveCredentials({
+        allowFirefox: true,
+        allowChrome: false,
+        firefoxProfile: 'abc.default-release',
+      });
 
       expect(result.cookies.authToken).toBe('firefox_auth');
       expect(result.cookies.ct0).toBe('firefox_ct0');

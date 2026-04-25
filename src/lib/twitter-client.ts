@@ -16,6 +16,7 @@ const FALLBACK_QUERY_IDS = {
   FavoriteTweet: 'lI07N6Otwv1PhnEgXILM7A',
   TweetDetail: 'nBS-WpgA6ZG0CyNHD517JQ',
   SearchTimeline: 'Tp1sewRU1AsZpBWhqCZicQ',
+  ListLatestTweetsTimeline: '2TemLyqrMpTeAmysdbnVqw',
 } as const;
 
 type OperationName = keyof typeof FALLBACK_QUERY_IDS;
@@ -48,6 +49,25 @@ type GraphqlTweetResult = {
   };
 };
 
+type TimelineTweetContent = {
+  itemContent?: { tweet_results?: { result?: GraphqlTweetResult } };
+  item?: { itemContent?: { tweet_results?: { result?: GraphqlTweetResult } } };
+  items?: Array<{
+    item?: { itemContent?: { tweet_results?: { result?: GraphqlTweetResult } } };
+    itemContent?: { tweet_results?: { result?: GraphqlTweetResult } };
+    content?: { itemContent?: { tweet_results?: { result?: GraphqlTweetResult } } };
+  }>;
+  cursorType?: string;
+  value?: string;
+};
+
+type TimelineEntry = { content?: TimelineTweetContent };
+type TimelineInstruction = { entries?: TimelineEntry[] };
+type ListTimelineResponse = {
+  data?: { list?: { tweets_timeline?: { timeline?: { instructions?: TimelineInstruction[] } } } };
+  errors?: Array<{ message: string; code?: number }>;
+};
+
 export interface TweetResult {
   success: boolean;
   tweetId?: string;
@@ -67,6 +87,18 @@ export interface TweetData {
   likeCount?: number;
   conversationId?: string;
   inReplyToStatusId?: string;
+  authorId?: string;
+  media?: Array<{
+    type: string;
+    url: string;
+    previewUrl?: string;
+    videoUrl?: string;
+    width?: number;
+    height?: number;
+    durationMs?: number;
+  }>;
+  quotedTweet?: TweetData;
+  _raw?: GraphqlTweetResult;
 }
 
 export interface GetTweetResult {
@@ -94,6 +126,20 @@ export interface CurrentUserResult {
 export interface TwitterClientOptions {
   cookies: TwitterCookies;
   userAgent?: string;
+  timeoutMs?: number;
+}
+
+export interface ListTimelineResult {
+  success: boolean;
+  tweets?: TweetData[];
+  nextCursor?: string;
+  error?: string;
+}
+
+export interface ListTimelineOptions {
+  cursor?: string;
+  includeRaw?: boolean;
+  maxPages?: number;
 }
 
 interface CreateTweetResponse {
@@ -116,6 +162,7 @@ export class TwitterClient {
   private authToken: string;
   private ct0: string;
   private userAgent: string;
+  private timeoutMs: number;
 
   constructor(options: TwitterClientOptions) {
     if (!options.cookies.authToken || !options.cookies.ct0) {
@@ -123,6 +170,7 @@ export class TwitterClient {
     }
     this.authToken = options.cookies.authToken;
     this.ct0 = options.cookies.ct0;
+    this.timeoutMs = options.timeoutMs ?? 30000;
     this.userAgent =
       options.userAgent ||
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -193,9 +241,22 @@ export class TwitterClient {
     };
   }
 
-  private mapTweetResult(result: GraphqlTweetResult | undefined): TweetData | undefined {
+  private async fetchWithTimeout(input: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private mapTweetResult(
+    result: GraphqlTweetResult | undefined,
+    options: { includeRaw?: boolean } = {},
+  ): TweetData | undefined {
     if (!result?.legacy || !result.core?.user_results?.result?.legacy?.screen_name) return undefined;
-    return {
+    const tweet: TweetData = {
       id: result.rest_id || '',
       text: result.legacy.full_text || '',
       createdAt: result.legacy.created_at,
@@ -209,6 +270,8 @@ export class TwitterClient {
         name: result.core.user_results.result.legacy.name || result.core.user_results.result.legacy.screen_name,
       },
     };
+    if (options.includeRaw) tweet._raw = result;
+    return tweet;
   }
 
   private parseTweetsFromInstructions(
@@ -851,5 +914,155 @@ export class TwitterClient {
     });
 
     return { success: true, tweets: thread };
+  }
+
+  private listTimelineFeatures(): Record<string, boolean> {
+    return {
+      rweb_tipjar_consumption_enabled: true,
+      responsive_web_graphql_exclude_directive_enabled: true,
+      verified_phone_label_enabled: false,
+      creator_subscriptions_tweet_preview_api_enabled: true,
+      responsive_web_graphql_timeline_navigation_enabled: true,
+      responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+      communities_web_enable_tweet_community_results_fetch: true,
+      c9s_tweet_anatomy_moderator_badge_enabled: true,
+      articles_preview_enabled: true,
+      responsive_web_edit_tweet_api_enabled: true,
+      graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
+      view_counts_everywhere_api_enabled: true,
+      longform_notetweets_consumption_enabled: true,
+      responsive_web_twitter_article_tweet_consumption_enabled: true,
+      tweet_awards_web_tipping_enabled: false,
+      creator_subscriptions_quote_tweet_preview_enabled: false,
+      freedom_of_speech_not_reach_fetch_enabled: true,
+      standardized_nudges_misinfo: true,
+      tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
+      rweb_video_timestamps_enabled: true,
+      longform_notetweets_rich_text_read_enabled: true,
+      longform_notetweets_inline_media_enabled: true,
+      responsive_web_enhance_cards_enabled: false,
+    };
+  }
+
+  private extractCursorFromInstructions(
+    instructions: TimelineInstruction[] | undefined,
+    cursorType = 'Bottom',
+  ): string | undefined {
+    for (const instruction of instructions ?? []) {
+      for (const entry of instruction.entries ?? []) {
+        const content = entry.content;
+        if (content?.cursorType === cursorType && typeof content.value === 'string' && content.value.length > 0) {
+          return content.value;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private collectTweetResultsFromEntry(entry: TimelineEntry): GraphqlTweetResult[] {
+    const results: GraphqlTweetResult[] = [];
+    const pushResult = (result: GraphqlTweetResult | undefined) => {
+      if (result?.rest_id) results.push(result);
+    };
+    const content = entry.content;
+    pushResult(content?.itemContent?.tweet_results?.result);
+    pushResult(content?.item?.itemContent?.tweet_results?.result);
+    for (const item of content?.items ?? []) {
+      pushResult(item?.item?.itemContent?.tweet_results?.result);
+      pushResult(item?.itemContent?.tweet_results?.result);
+      pushResult(item?.content?.itemContent?.tweet_results?.result);
+    }
+    return results;
+  }
+
+  private parseListTweetsFromInstructions(
+    instructions: TimelineInstruction[] | undefined,
+    includeRaw: boolean,
+  ): TweetData[] {
+    const tweets: TweetData[] = [];
+    const seen = new Set<string>();
+    for (const instruction of instructions ?? []) {
+      for (const entry of instruction.entries ?? []) {
+        for (const result of this.collectTweetResultsFromEntry(entry)) {
+          const mapped = this.mapTweetResult(result, { includeRaw });
+          if (!mapped || seen.has(mapped.id)) continue;
+          seen.add(mapped.id);
+          tweets.push(mapped);
+        }
+      }
+    }
+    return tweets;
+  }
+
+  async getListTimeline(listId: string, count = 20, options: ListTimelineOptions = {}): Promise<ListTimelineResult> {
+    return this.getListTimelinePaged(listId, count, options);
+  }
+
+  async getAllListTimeline(listId: string, options: ListTimelineOptions = {}): Promise<ListTimelineResult> {
+    return this.getListTimelinePaged(listId, Number.POSITIVE_INFINITY, options);
+  }
+
+  private async getListTimelinePaged(
+    listId: string,
+    limit: number,
+    options: ListTimelineOptions = {},
+  ): Promise<ListTimelineResult> {
+    const pageSize = 20;
+    const seen = new Set<string>();
+    const tweets: TweetData[] = [];
+    let cursor = options.cursor;
+    let nextCursor: string | undefined;
+    let pagesFetched = 0;
+    const unlimited = limit === Number.POSITIVE_INFINITY;
+
+    while (unlimited || tweets.length < limit) {
+      const pageCount = unlimited ? pageSize : Math.min(pageSize, limit - tweets.length);
+      const variables = { listId, count: pageCount, ...(cursor ? { cursor } : {}) };
+      const params = new URLSearchParams({
+        variables: JSON.stringify(variables),
+        features: JSON.stringify(this.listTimelineFeatures()),
+      });
+      const url = `${TWITTER_API_BASE}/${QUERY_IDS.ListLatestTweetsTimeline}/ListLatestTweetsTimeline?${params}`;
+
+      try {
+        const response = await this.fetchWithTimeout(url, { method: 'GET', headers: this.getHeaders() });
+        if (!response.ok) {
+          const text = await response.text();
+          return { success: false, error: `HTTP ${response.status}: ${text.slice(0, 200)}` };
+        }
+        const data = (await response.json()) as ListTimelineResponse;
+        if (data.errors && data.errors.length > 0) {
+          return { success: false, error: data.errors.map((e: { message: string }) => e.message).join(', ') };
+        }
+
+        const instructions = data.data?.list?.tweets_timeline?.timeline?.instructions;
+        const pageTweets = this.parseListTweetsFromInstructions(instructions, options.includeRaw ?? false);
+        pagesFetched += 1;
+        let added = 0;
+        for (const tweet of pageTweets) {
+          if (seen.has(tweet.id)) continue;
+          seen.add(tweet.id);
+          tweets.push(tweet);
+          added += 1;
+          if (!unlimited && tweets.length >= limit) break;
+        }
+
+        const pageCursor = this.extractCursorFromInstructions(instructions);
+        if (!pageCursor || pageCursor === cursor || pageTweets.length === 0 || added === 0) {
+          nextCursor = undefined;
+          break;
+        }
+        if (options.maxPages && pagesFetched >= options.maxPages) {
+          nextCursor = pageCursor;
+          break;
+        }
+        cursor = pageCursor;
+        nextCursor = pageCursor;
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    return { success: true, tweets, nextCursor };
   }
 }
